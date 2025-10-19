@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool, externalEuint32 } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+import { SepoliaZamaOracleAddress } from "@zama-fhe/oracle-solidity/address/ZamaOracleAddress.sol";
+import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+
+contract ProposalBoxGovernor is SepoliaConfig, AccessControl, ReentrancyGuard, Pausable {
+    enum ProposalStatus { Active, Ended, Decrypted, Executed }
+
+    struct Proposal {
+        uint256 id;
+        string title;
+        string description;
+        address proposer;
+        uint256 createdAt;
+        uint256 votingDeadline;
+        ProposalStatus status;
+        euint32 yesVotes;
+        euint32 noVotes;
+        euint32 abstainVotes;
+        uint32 decryptedYes;
+        uint32 decryptedNo;
+        uint32 decryptedAbstain;
+        uint256 totalVoters;
+        uint256[] decryptionRequestIds;
+    }
+
+    struct VoteRecord {
+        address voter;
+        uint256 proposalId;
+        uint256 votedAt;
+        bool hasVoted;
+    }
+
+    uint256 public proposalCount;
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => mapping(uint256 => VoteRecord)) public voteRecords;
+    mapping(uint256 => uint256) public requestIdToProposalId;
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant VOTER_ROLE = keccak256("VOTER_ROLE");
+    address public gatewayAddress;
+
+    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string title, uint256 votingDeadline);
+    event VoteCast(uint256 indexed proposalId, address indexed voter, uint256 timestamp);
+    event BatchVoteCast(address indexed voter, uint256[] proposalIds, uint256 timestamp);
+    event ProposalEnded(uint256 indexed proposalId, uint256 timestamp);
+    event DecryptionRequested(uint256 indexed proposalId, uint256 timestamp);
+    event ProposalDecrypted(uint256 indexed proposalId, uint32 yesVotes, uint32 noVotes, uint32 abstainVotes, uint256 timestamp);
+    event ProposalExecuted(uint256 indexed proposalId, bool passed, uint256 timestamp);
+
+    modifier proposalExists(uint256 proposalId) {
+        require(proposalId > 0 && proposalId <= proposalCount, "Proposal does not exist");
+        _;
+    }
+
+    modifier isActive(uint256 proposalId) {
+        require(proposals[proposalId].status == ProposalStatus.Active, "Proposal is not active");
+        require(block.timestamp < proposals[proposalId].votingDeadline, "Voting period has ended");
+        _;
+    }
+
+    modifier onlyGateway() {
+        require(msg.sender == gatewayAddress, "Only gateway can call this");
+        _;
+    }
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        gatewayAddress = SepoliaZamaOracleAddress;
+    }
+
+    function createProposal(string memory title, string memory description, uint256 votingDuration)
+        external returns (uint256)
+    {
+        require(bytes(title).length > 0, "Title cannot be empty");
+        require(votingDuration >= 1 hours, "Voting duration too short");
+        require(votingDuration <= 30 days, "Voting duration too long");
+
+        proposalCount++;
+        uint256 proposalId = proposalCount;
+
+        Proposal storage proposal = proposals[proposalId];
+        proposal.id = proposalId;
+        proposal.title = title;
+        proposal.description = description;
+        proposal.proposer = msg.sender;
+        proposal.createdAt = block.timestamp;
+        proposal.votingDeadline = block.timestamp + votingDuration;
+        proposal.status = ProposalStatus.Active;
+
+        proposal.yesVotes = FHE.asEuint32(0);
+        proposal.noVotes = FHE.asEuint32(0);
+        proposal.abstainVotes = FHE.asEuint32(0);
+
+        FHE.allowThis(proposal.yesVotes);
+        FHE.allowThis(proposal.noVotes);
+        FHE.allowThis(proposal.abstainVotes);
+
+        emit ProposalCreated(proposalId, msg.sender, title, proposal.votingDeadline);
+        return proposalId;
+    }
+
+    function endProposal(uint256 proposalId) external onlyRole(ADMIN_ROLE) proposalExists(proposalId) {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Active, "Proposal is not active");
+        require(block.timestamp >= proposal.votingDeadline, "Voting period not ended");
+        proposal.status = ProposalStatus.Ended;
+        emit ProposalEnded(proposalId, block.timestamp);
+    }
+
+    function grantVoterRole(address[] calldata voters) external onlyRole(ADMIN_ROLE) {
+        for (uint256 i = 0; i < voters.length; i++) {
+            _grantRole(VOTER_ROLE, voters[i]);
+        }
+    }
+
+    function vote(uint256 proposalId, externalEuint32 encryptedChoice, bytes calldata inputProof)
+        external nonReentrant whenNotPaused proposalExists(proposalId) isActive(proposalId)
+    {
+        VoteRecord storage record = voteRecords[msg.sender][proposalId];
+        require(!record.hasVoted, "Already voted on this proposal");
+
+        euint32 choice = FHE.fromExternal(encryptedChoice, inputProof);
+        FHE.allowThis(choice);
+
+
+        _recordVote(proposalId, choice);
+
+        record.voter = msg.sender;
+        record.proposalId = proposalId;
+        record.votedAt = block.timestamp;
+        record.hasVoted = true;
+        proposals[proposalId].totalVoters++;
+
+        emit VoteCast(proposalId, msg.sender, block.timestamp);
+    }
+
+    function batchVote(uint256[] calldata proposalIds, externalEuint32[] calldata encryptedChoices, bytes calldata inputProof)
+        external nonReentrant whenNotPaused
+    {
+        require(proposalIds.length == encryptedChoices.length, "Array length mismatch");
+        require(proposalIds.length > 0, "Empty arrays");
+        require(proposalIds.length <= 50, "Too many proposals");
+
+        for (uint256 i = 0; i < proposalIds.length; i++) {
+            uint256 proposalId = proposalIds[i];
+            require(proposalId > 0 && proposalId <= proposalCount, "Proposal does not exist");
+            require(proposals[proposalId].status == ProposalStatus.Active, "Proposal not active");
+            require(block.timestamp < proposals[proposalId].votingDeadline, "Voting ended");
+
+            VoteRecord storage record = voteRecords[msg.sender][proposalId];
+            require(!record.hasVoted, "Already voted on this proposal");
+
+            euint32 choice = FHE.fromExternal(encryptedChoices[i], inputProof);
+            FHE.allowThis(choice);
+
+
+            _recordVote(proposalId, choice);
+
+            record.voter = msg.sender;
+            record.proposalId = proposalId;
+            record.votedAt = block.timestamp;
+            record.hasVoted = true;
+            proposals[proposalId].totalVoters++;
+        }
+
+        emit BatchVoteCast(msg.sender, proposalIds, block.timestamp);
+    }
+
+    function _recordVote(uint256 proposalId, euint32 encryptedChoice) private {
+        Proposal storage proposal = proposals[proposalId];
+
+        ebool isYes = FHE.eq(encryptedChoice, FHE.asEuint32(1));
+        ebool isNo = FHE.eq(encryptedChoice, FHE.asEuint32(0));
+        ebool isAbstain = FHE.eq(encryptedChoice, FHE.asEuint32(2));
+
+        euint32 yesIncrement = FHE.select(isYes, FHE.asEuint32(1), FHE.asEuint32(0));
+        euint32 noIncrement = FHE.select(isNo, FHE.asEuint32(1), FHE.asEuint32(0));
+        euint32 abstainIncrement = FHE.select(isAbstain, FHE.asEuint32(1), FHE.asEuint32(0));
+
+        proposal.yesVotes = FHE.add(proposal.yesVotes, yesIncrement);
+        proposal.noVotes = FHE.add(proposal.noVotes, noIncrement);
+        proposal.abstainVotes = FHE.add(proposal.abstainVotes, abstainIncrement);
+
+        FHE.allowThis(proposal.yesVotes);
+        FHE.allowThis(proposal.noVotes);
+        FHE.allowThis(proposal.abstainVotes);
+    }
+
+    function requestDecryption(uint256 proposalId) external onlyRole(ADMIN_ROLE) proposalExists(proposalId) returns (uint256[] memory) {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Ended, "Proposal not ended");
+
+        bytes32[] memory cts = new bytes32[](3);
+        cts[0] = FHE.toBytes32(proposal.yesVotes);
+        cts[1] = FHE.toBytes32(proposal.noVotes);
+        cts[2] = FHE.toBytes32(proposal.abstainVotes);
+
+        uint256 requestId = FHE.requestDecryption(
+            cts,
+            this.fulfillDecryption.selector
+        );
+
+        uint256[] memory requestIds = new uint256[](1);
+        requestIds[0] = requestId;
+        proposal.decryptionRequestIds = requestIds;
+        requestIdToProposalId[requestId] = proposalId;
+
+        emit DecryptionRequested(proposalId, block.timestamp);
+        return requestIds;
+    }
+
+    function fulfillDecryption(uint256 requestId, uint32[] calldata decryptedValues) external {
+        require(decryptedValues.length == 3, "Invalid decrypted values length");
+
+        uint256 proposalId = requestIdToProposalId[requestId];
+        require(proposalId > 0, "Invalid request ID");
+
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Ended, "Proposal not in ended state");
+
+        proposal.decryptedYes = decryptedValues[0];
+        proposal.decryptedNo = decryptedValues[1];
+        proposal.decryptedAbstain = decryptedValues[2];
+        proposal.status = ProposalStatus.Decrypted;
+
+        emit ProposalDecrypted(proposalId, decryptedValues[0], decryptedValues[1], decryptedValues[2], block.timestamp);
+    }
+
+    function executeProposal(uint256 proposalId) external onlyRole(ADMIN_ROLE) proposalExists(proposalId) {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Decrypted, "Proposal not decrypted");
+
+        bool passed = proposal.decryptedYes > proposal.decryptedNo;
+        proposal.status = ProposalStatus.Executed;
+
+        emit ProposalExecuted(proposalId, passed, block.timestamp);
+    }
+
+    function getProposal(uint256 proposalId) external view proposalExists(proposalId) returns (Proposal memory) {
+        return proposals[proposalId];
+    }
+
+    function getProposalInfo(uint256 proposalId) external view proposalExists(proposalId)
+        returns (string memory title, string memory description, address proposer, uint256 createdAt,
+                uint256 votingDeadline, ProposalStatus status, uint256 totalVoters)
+    {
+        Proposal storage proposal = proposals[proposalId];
+        return (proposal.title, proposal.description, proposal.proposer, proposal.createdAt,
+                proposal.votingDeadline, proposal.status, proposal.totalVoters);
+    }
+
+    function getDecryptedResults(uint256 proposalId) external view proposalExists(proposalId)
+        returns (uint32 yesVotes, uint32 noVotes, uint32 abstainVotes)
+    {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Decrypted || proposal.status == ProposalStatus.Executed,
+                "Proposal not decrypted yet");
+        return (proposal.decryptedYes, proposal.decryptedNo, proposal.decryptedAbstain);
+    }
+
+    function hasVoted(address voter, uint256 proposalId) external view proposalExists(proposalId) returns (bool) {
+        return voteRecords[voter][proposalId].hasVoted;
+    }
+
+    function getVoteRecord(address voter, uint256 proposalId) external view proposalExists(proposalId)
+        returns (VoteRecord memory)
+    {
+        return voteRecords[voter][proposalId];
+    }
+
+    function getProposalsBatch(uint256 startId, uint256 count) external view returns (Proposal[] memory) {
+        require(startId > 0 && startId <= proposalCount, "Invalid start ID");
+
+        uint256 end = startId + count - 1;
+        if (end > proposalCount) end = proposalCount;
+
+        uint256 actualCount = end - startId + 1;
+        Proposal[] memory result = new Proposal[](actualCount);
+
+        for (uint256 i = 0; i < actualCount; i++) {
+            result[i] = proposals[startId + i];
+        }
+        return result;
+    }
+
+    function setGatewayAddress(address _gatewayAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_gatewayAddress != address(0), "Invalid gateway address");
+        gatewayAddress = _gatewayAddress;
+    }
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+}

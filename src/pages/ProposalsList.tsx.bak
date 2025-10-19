@@ -1,0 +1,156 @@
+import { useState, useEffect } from 'react';
+import { useReadContract } from 'wagmi';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { CONTRACT_ADDRESS, ABI } from '@/lib/contract';
+import { useNavigate } from 'react-router-dom';
+
+interface Proposal {
+  id: number;
+  title: string;
+  description: string;
+  startTime: bigint;
+  endTime: bigint;
+  votesFor: bigint;
+  votesAgainst: bigint;
+  votesAbstain: bigint;
+  isActive: boolean;
+}
+
+export default function ProposalsList() {
+  const navigate = useNavigate();
+  const [proposals, setProposals] = useState<Proposal[]>([]);
+
+  const { data: proposalCount } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: ABI,
+    functionName: 'proposalCount',
+  });
+
+  useEffect(() => {
+    if (!proposalCount) return;
+
+    const fetchProposals = async () => {
+      const count = Number(proposalCount);
+      const items: Proposal[] = [];
+
+      for (let i = 1; i <= count; i++) {
+        try {
+          const response = await fetch(`http://localhost:8545`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'eth_call',
+              params: [{
+                to: CONTRACT_ADDRESS,
+                data: `0x013cf08b${i.toString(16).padStart(64, '0')}` // proposals(uint256)
+              }, 'latest']
+            })
+          });
+
+          const data = await response.json();
+          if (data.result) {
+            // 解析返回的数据
+            const result = data.result.slice(2);
+            items.push({
+              id: i,
+              title: `Proposal #${i}`,
+              description: `Proposal ${i} description`,
+              startTime: BigInt('0x' + result.slice(128, 192)),
+              endTime: BigInt('0x' + result.slice(192, 256)),
+              votesFor: BigInt('0x' + result.slice(256, 320)),
+              votesAgainst: BigInt('0x' + result.slice(320, 384)),
+              votesAbstain: BigInt('0x' + result.slice(384, 448)),
+              isActive: parseInt(result.slice(448, 512), 16) === 1
+            });
+          }
+        } catch (error) {
+          console.error(`Failed to fetch proposal ${i}:`, error);
+        }
+      }
+
+      setProposals(items);
+    };
+
+    fetchProposals();
+  }, [proposalCount]);
+
+  const getStatus = (proposal: Proposal) => {
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (!proposal.isActive) return { label: 'Closed', variant: 'secondary' as const };
+    if (now < proposal.startTime) return { label: 'Pending', variant: 'outline' as const };
+    if (now > proposal.endTime) return { label: 'Ended', variant: 'destructive' as const };
+    return { label: 'Active', variant: 'default' as const };
+  };
+
+  const getTotalVotes = (p: Proposal) => p.votesFor + p.votesAgainst + p.votesAbstain;
+
+  return (
+    <div className="container mx-auto py-8 px-4">
+      <div className="flex justify-between items-center mb-8">
+        <div>
+          <h1 className="text-4xl font-bold mb-2">All Proposals</h1>
+          <p className="text-muted-foreground">Browse and vote on active proposals</p>
+        </div>
+        <Button onClick={() => navigate('/')}>Vote on Slates</Button>
+      </div>
+
+      {proposals.length === 0 ? (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            No proposals found
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid gap-4">
+          {proposals.map((proposal) => {
+            const status = getStatus(proposal);
+            const total = getTotalVotes(proposal);
+
+            return (
+              <Card key={proposal.id} className="hover:shadow-lg transition-shadow">
+                <CardHeader>
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <CardTitle className="text-2xl">{proposal.title}</CardTitle>
+                      <CardDescription className="mt-2">{proposal.description}</CardDescription>
+                    </div>
+                    <Badge variant={status.variant}>{status.label}</Badge>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-4 gap-4 text-sm">
+                    <div>
+                      <p className="text-muted-foreground">For</p>
+                      <p className="text-lg font-semibold text-green-600">{proposal.votesFor.toString()}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Against</p>
+                      <p className="text-lg font-semibold text-red-600">{proposal.votesAgainst.toString()}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Abstain</p>
+                      <p className="text-lg font-semibold text-gray-600">{proposal.votesAbstain.toString()}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Total</p>
+                      <p className="text-lg font-semibold">{total.toString()}</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 flex gap-4 text-xs text-muted-foreground">
+                    <span>Start: {new Date(Number(proposal.startTime) * 1000).toLocaleString()}</span>
+                    <span>End: {new Date(Number(proposal.endTime) * 1000).toLocaleString()}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}

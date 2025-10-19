@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/**
+ * @title ProposalBoxGovernor (Simplified Version for Testing)
+ * @notice 简化版治理合约，用于测试前后端集成
+ * @dev 生产环境请使用完整的FHE版本
+ */
+contract ProposalBoxGovernor {
+
+    enum ProposalStatus {
+        Active,
+        Ended,
+        Executed
+    }
+
+    enum VoteChoice {
+        Against,  // 0
+        For,      // 1
+        Abstain   // 2
+    }
+
+    struct Proposal {
+        uint256 id;
+        string title;
+        string description;
+        address proposer;
+        uint256 createdAt;
+        uint256 votingDeadline;
+        ProposalStatus status;
+
+        // 简化版使用明文计数
+        uint32 votesFor;
+        uint32 votesAgainst;
+        uint32 votesAbstain;
+
+        uint256 totalVoters;
+    }
+
+    // 状态变量
+    uint256 public proposalCount;
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => mapping(uint256 => bool)) public hasVoted;
+    mapping(address => bool) public isAdmin;
+    mapping(address => bool) public isVoter;
+
+    // 事件
+    event ProposalCreated(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        string title,
+        uint256 votingDeadline
+    );
+
+    event VoteCast(
+        uint256 indexed proposalId,
+        address indexed voter,
+        uint8 choice,
+        uint256 timestamp
+    );
+
+    event BatchVoteCast(
+        address indexed voter,
+        uint256[] proposalIds,
+        uint256 timestamp
+    );
+
+    event ProposalEnded(
+        uint256 indexed proposalId,
+        uint256 timestamp
+    );
+
+    event ProposalExecuted(
+        uint256 indexed proposalId,
+        bool passed,
+        uint256 timestamp
+    );
+
+    // 修饰器
+    modifier onlyAdmin() {
+        require(isAdmin[msg.sender], "Not admin");
+        _;
+    }
+
+    modifier onlyVoter() {
+        require(isVoter[msg.sender], "Not voter");
+        _;
+    }
+
+    modifier proposalExists(uint256 proposalId) {
+        require(proposalId > 0 && proposalId <= proposalCount, "Proposal does not exist");
+        _;
+    }
+
+    modifier isActive(uint256 proposalId) {
+        require(proposals[proposalId].status == ProposalStatus.Active, "Proposal not active");
+        require(block.timestamp < proposals[proposalId].votingDeadline, "Voting ended");
+        _;
+    }
+
+    constructor() {
+        isAdmin[msg.sender] = true;
+        isVoter[msg.sender] = true;
+    }
+
+    /**
+     * @notice 创建新提案
+     */
+    function createProposal(
+        string memory title,
+        string memory description,
+        uint256 votingDuration
+    ) external onlyAdmin returns (uint256) {
+        require(bytes(title).length > 0, "Title cannot be empty");
+        require(votingDuration >= 1 hours, "Duration too short");
+        require(votingDuration <= 30 days, "Duration too long");
+
+        proposalCount++;
+        uint256 proposalId = proposalCount;
+
+        Proposal storage proposal = proposals[proposalId];
+        proposal.id = proposalId;
+        proposal.title = title;
+        proposal.description = description;
+        proposal.proposer = msg.sender;
+        proposal.createdAt = block.timestamp;
+        proposal.votingDeadline = block.timestamp + votingDuration;
+        proposal.status = ProposalStatus.Active;
+
+        emit ProposalCreated(proposalId, msg.sender, title, proposal.votingDeadline);
+
+        return proposalId;
+    }
+
+    /**
+     * @notice 批量投票 (简化版 - 接受明文选择)
+     */
+    function batchVote(
+        uint256[] calldata proposalIds,
+        uint256[] calldata choices
+    ) external onlyVoter {
+        require(proposalIds.length == choices.length, "Array length mismatch");
+        require(proposalIds.length > 0, "Empty arrays");
+        require(proposalIds.length <= 50, "Too many proposals");
+
+        for (uint256 i = 0; i < proposalIds.length; i++) {
+            uint256 proposalId = proposalIds[i];
+            uint256 choice = choices[i];
+
+            require(proposalId > 0 && proposalId <= proposalCount, "Proposal does not exist");
+            require(proposals[proposalId].status == ProposalStatus.Active, "Proposal not active");
+            require(block.timestamp < proposals[proposalId].votingDeadline, "Voting ended");
+            require(!hasVoted[msg.sender][proposalId], "Already voted");
+            require(choice <= 2, "Invalid choice");
+
+            hasVoted[msg.sender][proposalId] = true;
+
+            Proposal storage proposal = proposals[proposalId];
+
+            if (choice == 0) {
+                proposal.votesAgainst++;
+            } else if (choice == 1) {
+                proposal.votesFor++;
+            } else {
+                proposal.votesAbstain++;
+            }
+
+            proposal.totalVoters++;
+
+            emit VoteCast(proposalId, msg.sender, uint8(choice), block.timestamp);
+        }
+
+        emit BatchVoteCast(msg.sender, proposalIds, block.timestamp);
+    }
+
+    /**
+     * @notice 结束提案
+     */
+    function endProposal(uint256 proposalId)
+        external
+        onlyAdmin
+        proposalExists(proposalId)
+    {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Active, "Proposal not active");
+        require(block.timestamp >= proposal.votingDeadline, "Voting not ended");
+
+        proposal.status = ProposalStatus.Ended;
+
+        emit ProposalEnded(proposalId, block.timestamp);
+    }
+
+    /**
+     * @notice 执行提案
+     */
+    function executeProposal(uint256 proposalId)
+        external
+        onlyAdmin
+        proposalExists(proposalId)
+    {
+        Proposal storage proposal = proposals[proposalId];
+        require(proposal.status == ProposalStatus.Ended, "Proposal not ended");
+
+        bool passed = proposal.votesFor > proposal.votesAgainst;
+        proposal.status = ProposalStatus.Executed;
+
+        emit ProposalExecuted(proposalId, passed, block.timestamp);
+    }
+
+    /**
+     * @notice 批量授予投票者角色
+     */
+    function grantVoterRole(address[] calldata voters) external onlyAdmin {
+        for (uint256 i = 0; i < voters.length; i++) {
+            isVoter[voters[i]] = true;
+        }
+    }
+
+    /**
+     * @notice 授予管理员角色
+     */
+    function grantAdminRole(address admin) external onlyAdmin {
+        isAdmin[admin] = true;
+    }
+
+    /**
+     * @notice 获取提案信息
+     */
+    function getProposal(uint256 proposalId)
+        external
+        view
+        proposalExists(proposalId)
+        returns (Proposal memory)
+    {
+        return proposals[proposalId];
+    }
+
+    /**
+     * @notice 获取投票结果
+     */
+    function getResults(uint256 proposalId)
+        external
+        view
+        proposalExists(proposalId)
+        returns (uint32 votesFor, uint32 votesAgainst, uint32 votesAbstain)
+    {
+        Proposal storage proposal = proposals[proposalId];
+        return (proposal.votesFor, proposal.votesAgainst, proposal.votesAbstain);
+    }
+
+    /**
+     * @notice 批量获取提案
+     */
+    function getProposalsBatch(uint256 startId, uint256 count)
+        external
+        view
+        returns (Proposal[] memory)
+    {
+        require(startId > 0 && startId <= proposalCount, "Invalid start ID");
+
+        uint256 end = startId + count - 1;
+        if (end > proposalCount) {
+            end = proposalCount;
+        }
+
+        uint256 actualCount = end - startId + 1;
+        Proposal[] memory result = new Proposal[](actualCount);
+
+        for (uint256 i = 0; i < actualCount; i++) {
+            result[i] = proposals[startId + i];
+        }
+
+        return result;
+    }
+}
